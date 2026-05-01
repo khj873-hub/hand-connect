@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>✨ HAND CONNECT</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;width:100vw;height:100vh;overflow:hidden;font-family:'Share Tech Mono',monospace;}
+
+/* 웹캠 — 완전히 숨김. 캔버스에서 직접 그림 */
+#webcam{
+  position:fixed;visibility:hidden;
+  width:1px;height:1px;
+}
+
+/* 메인 캔버스 — 배경(카메라)+레이저 모두 여기에 */
+#main-canvas{
+  position:fixed;top:0;left:0;
+  width:100%;height:100%;
+  z-index:10;
+}
+
+/* 랜드마크 캔버스 — 스켈레톤 */
+#lm-canvas{
+  position:fixed;top:0;left:0;
+  width:100%;height:100%;
+  z-index:20;pointer-events:none;
+}
+
+#hud{position:fixed;inset:0;z-index:30;pointer-events:none;}
+
+#stats{
+  position:absolute;top:16px;left:16px;
+  font-size:11px;line-height:2.2;
+  color:rgba(100,255,200,.85);
+}
+.sl{color:rgba(100,255,200,.45);}
+.sv{color:#00ffaa;}
+#sg{color:#00ffff;font-size:13px;}
+
+#title{position:absolute;top:16px;left:50%;transform:translateX(-50%);text-align:center;}
+#title h1{font-size:11px;letter-spacing:6px;color:rgba(200,220,255,.45);}
+
+#guide{
+  position:absolute;bottom:22px;left:50%;transform:translateX(-50%);
+  text-align:center;font-size:9px;letter-spacing:2px;
+  color:rgba(150,200,255,.35);line-height:2.4;
+}
+.gi{transition:color .2s,text-shadow .2s;}
+.gi.on{color:rgba(100,255,220,1);text-shadow:0 0 10px rgba(0,255,200,.7);}
+
+#loading{
+  position:fixed;inset:0;z-index:9999;background:#000510;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+}
+#loading h2{font-size:22px;letter-spacing:8px;color:#00ffaa;text-shadow:0 0 24px #00ffaa66;}
+#ld-bar{width:220px;height:1px;background:rgba(0,255,150,.1);}
+#ld-fill{height:100%;background:#00ffaa;box-shadow:0 0 8px #00ffaa;width:0;transition:width .4s;}
+#ld-msg{font-size:8px;letter-spacing:3px;color:rgba(0,255,150,.4);}
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <h2>HAND CONNECT</h2>
+  <div id="ld-bar"><div id="ld-fill"></div></div>
+  <div id="ld-msg">INITIALIZING...</div>
+</div>
+
+<!-- 숨긴 비디오 — MediaPipe 입력 전용 -->
+<video id="webcam" autoplay playsinline muted></video>
+
+<!-- 배경+레이저 캔버스 -->
+<canvas id="main-canvas"></canvas>
+<!-- 스켈레톤 캔버스 -->
+<canvas id="lm-canvas"></canvas>
+
+<div id="hud">
+  <div id="stats">
+    <div><span class="sl">Hands Detected: </span><span class="sv" id="sh">0</span></div>
+    <div><span class="sl">Frame: </span><span class="sv" id="sf">0</span></div>
+    <div><span class="sl">Gesture: </span><span id="sg">—</span></div>
+  </div>
+  <div id="title"><h1>HAND CONNECT</h1></div>
+  <div id="guide">
+    <div class="gi" id="g-connect">🙌  양손 마주보기 — 레이저 연결</div>
+    <div class="gi" id="g-open">✋  오픈핸드 — 자체 연결</div>
+    <div class="gi" id="g-point">☝️  검지 포인트 — 스크롤</div>
+    <div class="gi" id="g-pinch">🤌  핀치 — 빔 강화</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+'use strict';
+
+// ── 로딩 ──────────────────────────────────────────
+function ld(p,m){
+  document.getElementById('ld-fill').style.width=p+'%';
+  document.getElementById('ld-msg').textContent=m;
+}
+
+// ── 엘리먼트 참조 — 맨 위에 선언 ─────────────────
+const videoEl     = document.getElementById('webcam');
+const mainCanvas  = document.getElementById('main-canvas');
+const lmCanvas    = document.getElementById('lm-canvas');
+const mCtx        = mainCanvas.getContext('2d');
+const lCtx        = lmCanvas.getContext('2d');
+
+function resize(){
+  mainCanvas.width = lmCanvas.width  = window.innerWidth;
+  mainCanvas.height= lmCanvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── 유틸 ──────────────────────────────────────────
+// MediaPipe 좌표 → 화면 픽셀 (미러 보정: x 반전)
+function pt(lm, i){
+  return {
+    x: (1 - lm[i].x) * window.innerWidth,
+    y:      lm[i].y  * window.innerHeight,
+  };
+}
+
+function rainbow(t, a=1){
+  return `hsla(${(t%1)*300},100%,65%,${a})`;
+}
+
+// ── 레이저 빔 ─────────────────────────────────────
+function laser(ctx, x1,y1, x2,y2, t, w=2, g=18, a=1){
+  const c1 = rainbow(t, a);
+  const c2 = rainbow((t+0.12)%1, a*0.8);
+  const c3 = rainbow((t+0.25)%1, a*0.5);
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+
+  // 가장 바깥 헤이즈 (매우 넓고 흐림)
+  ctx.globalAlpha = a * 0.25;
+  ctx.strokeStyle = c3; ctx.lineWidth = w * 14;
+  ctx.shadowColor = c3; ctx.shadowBlur = g * 4;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+
+  // 외곽 글로우
+  ctx.globalAlpha = a * 0.55;
+  ctx.strokeStyle = c1; ctx.lineWidth = w * 6;
+  ctx.shadowColor = c1; ctx.shadowBlur = g * 3;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+
+  // 중간 레이어
+  ctx.globalAlpha = a * 0.85;
+  ctx.strokeStyle = c2; ctx.lineWidth = w * 2.5;
+  ctx.shadowBlur  = g * 1.5;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+
+  // 코어 (흰색 심)
+  ctx.globalAlpha = a;
+  ctx.strokeStyle = 'rgba(255,255,255,1)';
+  ctx.lineWidth   = w * 0.6;
+  ctx.shadowColor = '#fff'; ctx.shadowBlur = g * 0.6;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── 손 오라 & 파동 효과 ───────────────────────────
+let auraT = 0; // 오라 애니메이션 시간
+
+function drawAura(lm, colorOff){
+  auraT += 0.018;
+
+  // 1. 손가락 끝마다 헤일로 글로우
+  TIPS.forEach((ti, fi)=>{
+    const p = pt(lm, ti);
+    const t = ((fi/5) + colorOff + auraT * 0.3) % 1;
+    const col = rainbow(t, 1);
+
+    // 바깥 헤이즈
+    const r1 = 28 + Math.sin(auraT * 3 + fi) * 8;
+    const grd1 = lCtx.createRadialGradient(p.x, p.y, 2, p.x, p.y, r1);
+    grd1.addColorStop(0, rainbow(t, 0.5));
+    grd1.addColorStop(0.4, rainbow(t, 0.25));
+    grd1.addColorStop(1, rainbow(t, 0));
+    lCtx.save();
+    lCtx.globalCompositeOperation = 'screen';
+    lCtx.beginPath(); lCtx.arc(p.x, p.y, r1, 0, Math.PI*2);
+    lCtx.fillStyle = grd1; lCtx.fill();
+
+    // 안쪽 밝은 코어
+    const r2 = 10 + Math.sin(auraT * 5 + fi) * 3;
+    const grd2 = lCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r2);
+    grd2.addColorStop(0, 'rgba(255,255,255,0.9)');
+    grd2.addColorStop(0.3, rainbow(t, 0.8));
+    grd2.addColorStop(1, rainbow(t, 0));
+    lCtx.beginPath(); lCtx.arc(p.x, p.y, r2, 0, Math.PI*2);
+    lCtx.fillStyle = grd2; lCtx.fill();
+    lCtx.restore();
+
+    // 파동 링 (맥박)
+    const waveR = 20 + ((auraT * 60 + fi * 15) % 50);
+    const waveA = Math.max(0, 1 - waveR / 70);
+    lCtx.save();
+    lCtx.globalCompositeOperation = 'screen';
+    lCtx.globalAlpha = waveA * 0.7;
+    lCtx.strokeStyle = col;
+    lCtx.lineWidth = 1.5;
+    lCtx.shadowColor = col; lCtx.shadowBlur = 10;
+    lCtx.beginPath(); lCtx.arc(p.x, p.y, waveR, 0, Math.PI*2); lCtx.stroke();
+    lCtx.restore();
+  });
+
+  // 2. 손바닥 중심 오라
+  const palm = pt(lm, 0);
+  const pt9  = pt(lm, 9);  // 중지 기저 — 손 중앙 기준
+  const cx = (palm.x + pt9.x) * 0.5;
+  const cy = (palm.y + pt9.y) * 0.5;
+  const ct = (colorOff + auraT * 0.2) % 1;
+
+  const palmR = 45 + Math.sin(auraT * 2) * 10;
+  const grdP = lCtx.createRadialGradient(cx, cy, 5, cx, cy, palmR);
+  grdP.addColorStop(0, rainbow(ct, 0.35));
+  grdP.addColorStop(0.5, rainbow((ct+0.15)%1, 0.15));
+  grdP.addColorStop(1, rainbow(ct, 0));
+  lCtx.save();
+  lCtx.globalCompositeOperation = 'screen';
+  lCtx.beginPath(); lCtx.arc(cx, cy, palmR, 0, Math.PI*2);
+  lCtx.fillStyle = grdP; lCtx.fill();
+
+  // 손바닥 파동 링 2개 (엇갈리게)
+  [0, 0.5].forEach(offset=>{
+    const wr = 30 + ((auraT * 45 + offset * 30) % 60);
+    const wa = Math.max(0, 1 - wr / 90) * 0.5;
+    lCtx.globalAlpha = wa;
+    lCtx.strokeStyle = rainbow((ct + offset) % 1, 1);
+    lCtx.lineWidth = 1;
+    lCtx.shadowColor = rainbow(ct, 1); lCtx.shadowBlur = 8;
+    lCtx.beginPath(); lCtx.arc(cx, cy, wr, 0, Math.PI*2); lCtx.stroke();
+  });
+  lCtx.restore();
+}
+
+// ── 손 와이어프레임 ────────────────────────────────
+const CONN=[
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17]
+];
+const TIPS=[4,8,12,16,20];
+
+function drawWire(lm, off){
+  CONN.forEach(([a,b],i)=>{
+    const pa=pt(lm,a), pb=pt(lm,b);
+    const t=((i/CONN.length)+off)%1;
+    lCtx.save();
+    lCtx.globalAlpha=.55;
+    lCtx.strokeStyle=rainbow(t);
+    lCtx.lineWidth=1;
+    lCtx.shadowColor=rainbow(t); lCtx.shadowBlur=5;
+    lCtx.beginPath(); lCtx.moveTo(pa.x,pa.y); lCtx.lineTo(pb.x,pb.y); lCtx.stroke();
+    lCtx.restore();
+  });
+  lm.forEach((_,i)=>{
+    const p=pt(lm,i);
+    const t=((i/21)+off)%1;
+    const tip=TIPS.includes(i);
+    lCtx.save();
+    lCtx.globalAlpha=tip?1:.65;
+    lCtx.shadowColor=rainbow(t); lCtx.shadowBlur=tip?14:5;
+    lCtx.beginPath(); lCtx.arc(p.x,p.y,tip?5:2.5,0,Math.PI*2);
+    lCtx.fillStyle=tip?'#fff':rainbow(t); lCtx.fill();
+    lCtx.restore();
+  });
+}
+
+// ── 양손 레이저 연결 ───────────────────────────────
+let bt=0; // beam time
+
+function drawConnect(lm0,lm1){
+  bt+=0.013;
+  // 5×5 손가락 끝 연결
+  TIPS.forEach((ti,fi)=>{
+    TIPS.forEach((tj,fj)=>{
+      const a=pt(lm0,ti), b=pt(lm1,tj);
+      const same=(fi===fj);
+      const t=((fi+fj)/8+bt)%1;
+      laser(mCtx, a.x,a.y, b.x,b.y, t,
+        same ? 3.5 : 1.8,   // 두께 증가
+        same ? 32  : 18,    // 글로우 증가
+        same ? 1.0 : 0.6    // 불투명도 증가
+      );
+    });
+  });
+  // 손바닥 연결
+  const p0=pt(lm0,0), p1=pt(lm1,0);
+  laser(mCtx, p0.x,p0.y, p1.x,p1.y, (bt*.65)%1, 5, 36, .6);
+}
+
+// ── 단일 손 자체 연결 ─────────────────────────────
+function drawSelf(lm){
+  bt+=0.013;
+  const palm=pt(lm,0);
+  TIPS.forEach((ti,fi)=>{
+    TIPS.forEach((tj,fj)=>{
+      if(fi>=fj) return;
+      const a=pt(lm,ti), b=pt(lm,tj);
+      laser(mCtx, a.x,a.y, b.x,b.y, ((fi+fj)/8+bt)%1, 2.2, 20, .8);
+    });
+    const tip=pt(lm,ti);
+    laser(mCtx, tip.x,tip.y, palm.x,palm.y, (fi/5+bt)%1, 1.2, 12, .4);
+  });
+}
+
+// ── 제스처 분류 ───────────────────────────────────
+function fingers(lm){
+  const tips=[8,12,16,20],pips=[6,10,14,18],mcps=[5,9,13,17];
+  return tips.map((t,i)=>lm[t].y<lm[pips[i]].y-.025&&lm[pips[i]].y<lm[mcps[i]].y+.04);
+}
+function classify(lm){
+  const pinch=Math.hypot(lm[4].x-lm[8].x,lm[4].y-lm[8].y);
+  if(pinch<.06) return 'PINCH';
+  const f=fingers(lm), n=f.filter(Boolean).length;
+  if(n===0) return 'FIST';
+  if(f[0]&&!f[1]&&!f[2]&&!f[3]) return 'POINT';
+  if(n>=3) return 'OPEN';
+  return 'NEUTRAL';
+}
+
+// ── 손 상태 ───────────────────────────────────────
+const HS={lm:[null,null], gest:['NONE','NONE'], count:0, prevCount:0};
+let frame=0;
+
+// ── Web Audio — 연결 사운드 ───────────────────────
+let audioCtx=null;
+let connDrone=null, connDroneGain=null;
+let connActive=false;
+
+function initAudio(){
+  if(audioCtx) return;
+  audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+}
+
+// 양손 연결 시 흐르는 드론 사운드 시작
+function startConnSound(){
+  if(!audioCtx||connDrone) return;
+  connDroneGain=audioCtx.createGain();
+  connDroneGain.gain.setValueAtTime(0.001,audioCtx.currentTime);
+  connDroneGain.gain.linearRampToValueAtTime(0.18,audioCtx.currentTime+0.4);
+  connDroneGain.connect(audioCtx.destination);
+
+  // 기본 드론 오실레이터 3개 (화음)
+  [[220,'sine'],[330,'triangle'],[440,'sine']].forEach(([f,type],i)=>{
+    const o=audioCtx.createOscillator();
+    const g=audioCtx.createGain();
+    o.type=type; o.frequency.value=f;
+    g.gain.value=0.3-i*0.08;
+    // LFO 비브라토
+    const lfo=audioCtx.createOscillator();
+    const lg=audioCtx.createGain();
+    lfo.frequency.value=0.5+i*0.3; lg.gain.value=2;
+    lfo.connect(lg); lg.connect(o.detune);
+    lfo.start(); o.connect(g); g.connect(connDroneGain); o.start();
+  });
+  connDrone=connDroneGain;
+}
+
+// 양손 거리에 따라 피치/볼륨 변화
+function updateConnSound(dist){
+  if(!audioCtx||!connDroneGain) return;
+  // dist: 0~1 (정규화된 두 손 거리)
+  const vol=0.08+dist*0.18;
+  connDroneGain.gain.setTargetAtTime(vol,audioCtx.currentTime,0.08);
+}
+
+function stopConnSound(){
+  if(!connDroneGain) return;
+  connDroneGain.gain.setTargetAtTime(0.001,audioCtx.currentTime,0.15);
+  setTimeout(()=>{ try{connDrone=null; connDroneGain=null;}catch(e){} },400);
+}
+
+// 연결 시작 시 짧은 차임 사운드
+function playConnectChime(){
+  if(!audioCtx) return;
+  [523,659,784,1047].forEach((f,i)=>{
+    const o=audioCtx.createOscillator();
+    const g=audioCtx.createGain();
+    const t=audioCtx.currentTime+i*0.07;
+    o.type='sine'; o.frequency.value=f;
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.15,t+0.04);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.4);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t+0.45);
+  });
+}
+
+// 연결 해제 시 페이드 아웃 음
+function playDisconnectSound(){
+  if(!audioCtx) return;
+  [784,659,523,392].forEach((f,i)=>{
+    const o=audioCtx.createOscillator();
+    const g=audioCtx.createGain();
+    const t=audioCtx.currentTime+i*0.06;
+    o.type='sine'; o.frequency.value=f;
+    g.gain.setValueAtTime(0.1,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.3);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t+0.35);
+  });
+}
+
+// ── 스크롤 시스템 ─────────────────────────────────
+const scroll={
+  active: false,       // 스크롤 모드 활성
+  prevY: null,         // 이전 검지 Y
+  velocity: 0,         // 관성 속도
+  sensitivity: 12,     // 스크롤 민감도
+};
+
+// 검지 Y 위치 변화 → window.scrollBy
+function applyScroll(lm){
+  const tip=pt(lm,8); // 검지 끝
+  const H=window.innerHeight;
+  const ny=lm[8].y;   // 정규화 Y
+
+  if(scroll.prevY!==null){
+    const dy=(ny-scroll.prevY)*H;
+    scroll.velocity=dy*scroll.sensitivity;
+    window.scrollBy({top:scroll.velocity, behavior:'auto'});
+  }
+  scroll.prevY=ny;
+
+  // 스크롤 인디케이터 그리기
+  drawScrollIndicator(tip, ny);
+}
+
+function drawScrollIndicator(tip, ny){
+  const W=window.innerWidth, H=window.innerHeight;
+  // 검지 끝 위치에 스크롤 커서
+  lCtx.save();
+  lCtx.globalCompositeOperation='screen';
+
+  // 화살표 방향 표시
+  const dir=scroll.velocity>0?1:-1;
+  const arrowY=dir>0?tip.y+30:tip.y-30;
+
+  // 커서 원
+  const grd=lCtx.createRadialGradient(tip.x,tip.y,0,tip.x,tip.y,22);
+  grd.addColorStop(0,'rgba(255,255,255,0.9)');
+  grd.addColorStop(0.4,`hsla(${180+ny*60},100%,65%,0.7)`);
+  grd.addColorStop(1,'rgba(0,200,255,0)');
+  lCtx.beginPath(); lCtx.arc(tip.x,tip.y,22,0,Math.PI*2);
+  lCtx.fillStyle=grd; lCtx.fill();
+
+  // 스크롤바 (오른쪽 가장자리)
+  const barX=W-24;
+  const barH=H*0.6;
+  const barY=(H-barH)/2;
+  const scrollRatio=window.scrollY/(document.body.scrollHeight-H||1);
+  const thumbY=barY+scrollRatio*barH;
+
+  lCtx.globalAlpha=0.5;
+  lCtx.strokeStyle='rgba(0,255,200,0.4)';
+  lCtx.lineWidth=2;
+  lCtx.beginPath(); lCtx.moveTo(barX,barY); lCtx.lineTo(barX,barY+barH); lCtx.stroke();
+
+  lCtx.globalAlpha=0.9;
+  lCtx.fillStyle='rgba(0,255,200,0.8)';
+  lCtx.shadowColor='#00ffcc'; lCtx.shadowBlur=8;
+  lCtx.beginPath(); lCtx.arc(barX,thumbY,5,0,Math.PI*2); lCtx.fill();
+
+  // SCROLL 레이블
+  lCtx.globalAlpha=0.7;
+  lCtx.fillStyle='rgba(0,255,200,0.8)';
+  lCtx.font='bold 10px Share Tech Mono';
+  lCtx.letterSpacing='2px';
+  lCtx.fillText('SCROLL',tip.x+28,tip.y+4);
+
+  lCtx.restore();
+}
+
+// ── 렌더 루프 ─────────────────────────────────────
+function render(){
+  requestAnimationFrame(render);
+  frame++;
+
+  const W=window.innerWidth, H=window.innerHeight;
+
+  // ① 카메라 영상을 배경으로 그리기 (미러 반전)
+  mCtx.save();
+  mCtx.translate(W, 0);
+  mCtx.scale(-1, 1);
+  mCtx.drawImage(videoEl, 0, 0, W, H);
+  mCtx.restore();
+
+  // ② 레이저 꼬리 잔상 (반투명 검정 — 얇게 해서 꼬리 길게)
+  mCtx.fillStyle='rgba(0,0,0,0.10)';
+  mCtx.fillRect(0,0,W,H);
+
+  // ③ 스켈레톤 캔버스 클리어
+  lCtx.clearRect(0,0,W,H);
+
+  const lm0=HS.lm[0], lm1=HS.lm[1];
+  const g0=HS.gest[0], g1=HS.gest[1];
+
+  // 가이드 리셋
+  ['g-connect','g-open','g-pinch'].forEach(id=>
+    document.getElementById(id)?.classList.remove('on'));
+
+  if(HS.count>=2 && lm0 && lm1){
+    // ── 양손 연결 ────────────────────────────────
+    document.getElementById('g-connect')?.classList.add('on');
+
+    // 처음 연결될 때 차임 + 드론 시작
+    if(!connActive){
+      initAudio();
+      playConnectChime();
+      startConnSound();
+      connActive=true;
+    }
+    // 두 손 거리로 드론 볼륨 변화
+    const p0=pt(lm0,0), p1=pt(lm1,0);
+    const rawDist=Math.hypot(p0.x-p1.x,p0.y-p1.y)/window.innerWidth;
+    updateConnSound(rawDist);
+
+    drawAura(lm0, 0);
+    drawAura(lm1, 0.5);
+    drawWire(lm0, 0);
+    drawWire(lm1, 0.5);
+    const anyPinch = g0==='PINCH'||g1==='PINCH';
+    if(anyPinch){
+      document.getElementById('g-pinch')?.classList.add('on');
+      mCtx.save();
+      mCtx.globalCompositeOperation='screen';
+      drawConnect(lm0,lm1);
+      mCtx.restore();
+    } else {
+      drawConnect(lm0,lm1);
+    }
+    document.getElementById('sg').textContent=
+      [g0,g1].filter(g=>g!=='NONE').join(' + ')||'—';
+    scroll.prevY=null; // 양손일 땐 스크롤 리셋
+
+  } else if(HS.count===1 && lm0){
+    // ── 단일 손 ──────────────────────────────────
+    // 양손 → 단일 손으로 전환 시 사운드 끊기
+    if(connActive){
+      stopConnSound();
+      playDisconnectSound();
+      connActive=false;
+    }
+
+    drawAura(lm0, 0);
+    drawWire(lm0, 0);
+
+    if(g0==='OPEN'){
+      document.getElementById('g-open')?.classList.add('on');
+      drawSelf(lm0);
+      scroll.prevY=null;
+    }
+    // ☝️ POINT — 스크롤 모드
+    if(g0==='POINT'){
+      initAudio();
+      document.getElementById('g-point')?.classList.add('on');
+      applyScroll(lm0);
+    } else {
+      scroll.prevY=null;
+    }
+    if(g0==='PINCH') document.getElementById('g-pinch')?.classList.add('on');
+    document.getElementById('sg').textContent = g0;
+
+  } else {
+    // 손 없음
+    if(connActive){
+      stopConnSound();
+      playDisconnectSound();
+      connActive=false;
+    }
+    scroll.prevY=null;
+    document.getElementById('sg').textContent='—';
+  }
+
+  document.getElementById('sh').textContent=HS.count;
+  document.getElementById('sf').textContent=frame;
+}
+requestAnimationFrame(render);
+
+// ── MediaPipe ─────────────────────────────────────
+ld(50,'LOADING HAND AI...');
+
+const handsMP=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+handsMP.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.7,minTrackingConfidence:.6});
+handsMP.onResults(res=>{
+  const all=res.multiHandLandmarks||[];
+  HS.count=all.length;
+  HS.lm=[null,null];
+  HS.gest=['NONE','NONE'];
+  all.forEach((lm,i)=>{ if(i<2){HS.lm[i]=lm; HS.gest[i]=classify(lm);} });
+});
+
+// ── 카메라 ───────────────────────────────────────
+ld(80,'OPENING CAMERA...');
+(async()=>{
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia(
+      {video:{width:1280,height:720,facingMode:'user'}}
+    );
+    videoEl.srcObject=stream;
+    new Camera(videoEl,{
+      onFrame:async()=>await handsMP.send({image:videoEl}),
+      width:1280,height:720
+    }).start();
+    ld(100,'CONNECTED');
+  }catch(e){
+    console.warn('Camera denied:', e);
+    ld(100,'NO CAMERA — run: python3 -m http.server 8080');
+  }
+  setTimeout(()=>{
+    const el=document.getElementById('loading');
+    el.style.transition='opacity .7s';
+    el.style.opacity='0';
+    setTimeout(()=>el.remove(),800);
+  },400);
+})();
+</script>
+</body>
+</html>
